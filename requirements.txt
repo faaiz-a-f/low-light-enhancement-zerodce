@@ -12,3 +12,4 @@ scikit-image
 lpips
 piq
 streamlit
+cv2
