@@ -5,23 +5,45 @@ import numpy as np
 from PIL import Image
 import io
 import time
+import os
+import cv2
 
-# ─────────────────────────────────────────────
-# Model architecture (must match training code)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Model Registry — add or remove versions here
+# Place .pth files in the same folder as app.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+MODEL_REGISTRY = {
+    "v4 — SE-Block, per-patch exposure (latest)": {
+        "file":    "best_zerodce_seblock_v4.pth",
+        "desc":    "No L_tv_enh, per-patch MSE exposure, collapse guard. Best overall quality.",
+        "tag":     "Recommended",
+        "tag_color": "#1a3a2a",
+        "tag_text":  "#68d391",
+    },
+    "v2 — SE-Block baseline (stable)": {
+        "file":    "best_zerodce_seblock_v2.pth",
+        "desc":    "Fixed alpha (tanh), correct loss weights, fixed dataset pairing.",
+        "tag":     "Stable",
+        "tag_color": "#1e3a5f",
+        "tag_text":  "#90cdf4",
+    },
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture (identical to training code)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class SEBlock(nn.Module):
-    """Squeeze-and-Excitation Block for Channel Attention"""
     def __init__(self, channels, reduction=8):
-        super(SEBlock, self).__init__()
+        super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(channels, channels // reduction, bias=False),
             nn.ReLU(inplace=True),
             nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
-
     def forward(self, x):
         b, c, _, _ = x.shape
         w = self.pool(x).view(b, c)
@@ -30,24 +52,19 @@ class SEBlock(nn.Module):
 
 
 class DCENet(nn.Module):
-    """Zero-DCE++ with Channel Attention after Conv3"""
     def __init__(self, use_attention=True):
-        super(DCENet, self).__init__()
+        super().__init__()
         self.use_attention = use_attention
-
-        self.conv1 = nn.Conv2d(3, 32, 3, 1, 1)
+        self.conv1 = nn.Conv2d(3,  32, 3, 1, 1)
         self.conv2 = nn.Conv2d(32, 32, 3, 1, 1)
         self.conv3 = nn.Conv2d(32, 32, 3, 1, 1)
-
         if use_attention:
             self.se = SEBlock(32, reduction=8)
-
         self.conv4 = nn.Conv2d(32, 32, 3, 1, 1)
         self.conv5 = nn.Conv2d(64, 32, 3, 1, 1)
         self.conv6 = nn.Conv2d(64, 32, 3, 1, 1)
         self.conv7 = nn.Conv2d(64, 24, 3, 1, 1)
         self.relu  = nn.ReLU(inplace=True)
-
         nn.init.normal_(self.conv7.weight, mean=0, std=0.01)
         nn.init.constant_(self.conv7.bias, 0)
 
@@ -55,346 +72,512 @@ class DCENet(nn.Module):
         x1 = self.relu(self.conv1(x))
         x2 = self.relu(self.conv2(x1))
         x3 = self.relu(self.conv3(x2))
-
         if self.use_attention:
             x3 = self.se(x3)
-
         x4 = self.relu(self.conv4(x3))
-        x5 = torch.cat([x4, x3], 1)
-        x5 = self.relu(self.conv5(x5))
-        x6 = torch.cat([x5, x2], 1)
-        x6 = self.relu(self.conv6(x6))
-        x7 = torch.cat([x6, x1], 1)
-        alpha = self.conv7(x7)
-        return torch.tanh(alpha)
+        x5 = self.relu(self.conv5(torch.cat([x4, x3], 1)))
+        x6 = self.relu(self.conv6(torch.cat([x5, x2], 1)))
+        return torch.tanh(self.conv7(torch.cat([x6, x1], 1)))
 
 
 def enhance_image_with_curves(x, alpha, iterations=8):
-    """Apply Zero-DCE curve: LE(x; α) = x + α·x·(1−x), N times"""
     enhanced = x.clone()
     for i in range(iterations):
-        alpha_i = alpha[:, i * 3:(i + 1) * 3, :, :]
-        enhanced = enhanced + alpha_i * enhanced * (1 - enhanced)
+        a_i = alpha[:, i*3:(i+1)*3, :, :]
+        enhanced = enhanced + a_i * enhanced * (1 - enhanced)
     return torch.clamp(enhanced, 0, 1)
 
 
-# ─────────────────────────────────────────────
-# Helper functions
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def load_model(weights_path: str, device: torch.device):
-    model = DCENet(use_attention=True).to(device)
-    state = torch.load(weights_path, map_location=device)
-    model.load_state_dict(state)
-    model.eval()
-    return model
+def load_model(weights_path: str):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    m = DCENet(use_attention=True).to(device)
+    m.load_state_dict(torch.load(weights_path, map_location=device))
+    m.eval()
+    return m, device
 
 
-def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
-    arr = tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
-    return Image.fromarray(arr)
-
-
-def pil_to_tensor(img: Image.Image, device: torch.device) -> torch.Tensor:
+def pil_to_tensor(img: Image.Image, device) -> torch.Tensor:
     arr = np.array(img).astype(np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
-    return tensor
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
 
 
-def enhance(model, img: Image.Image, device: torch.device, iterations: int = 8) -> Image.Image:
-    tensor = pil_to_tensor(img, device)
+def tensor_to_pil(t: torch.Tensor) -> Image.Image:
+    arr = t.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    return Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+
+
+def bilateral_denoise(img: Image.Image, d=9, sigma_color=75, sigma_space=75) -> Image.Image:
+    """Edge-preserving bilateral filter. Reduces noise without blurring edges."""
+    arr = np.array(img)
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    bgr = cv2.bilateralFilter(bgr, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
+
+def run_enhance(model, device, img: Image.Image, iterations: int,
+                denoise: bool, d: int, sigma_color: int, sigma_space: int):
+    tensor   = pil_to_tensor(img, device)
     with torch.no_grad():
-        alpha = model(tensor)
+        alpha    = model(tensor)
         enhanced = enhance_image_with_curves(tensor, alpha, iterations=iterations)
-    return tensor_to_pil(enhanced)
+    result = tensor_to_pil(enhanced)
+    if denoise:
+        result = bilateral_denoise(result, d=d,
+                                   sigma_color=sigma_color,
+                                   sigma_space=sigma_space)
+    return result
 
 
-def pil_to_bytes(img: Image.Image, fmt="PNG") -> bytes:
+def pil_to_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format=fmt)
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-# ─────────────────────────────────────────────
+def avg_brightness(img: Image.Image) -> float:
+    return float(np.array(img).mean())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Page config
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Zero-DCE++ Low-Light Enhancer",
+    page_title="Zero-DCE++ | Low-Light Enhancer",
     page_icon="🌙",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────
-# Custom CSS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown("""
 <style>
-    /* Main background */
-    .stApp { background-color: #0f1117; }
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap');
 
-    /* Sidebar */
-    [data-testid="stSidebar"] { background-color: #1a1d27; }
+html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 
-    /* Cards */
-    .img-card {
-        background: #1e2130;
-        border-radius: 12px;
-        padding: 16px;
-        border: 1px solid #2d3148;
-        text-align: center;
-    }
-    .img-card h4 {
-        color: #a0aec0;
-        font-size: 13px;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        margin-bottom: 10px;
-    }
+.stApp {
+    background: #080b14;
+    background-image:
+        radial-gradient(ellipse 80% 50% at 50% -10%, #0d1f3c 0%, transparent 70%),
+        radial-gradient(ellipse 40% 30% at 80% 80%, #0a1628 0%, transparent 60%);
+}
 
-    /* Badge */
-    .badge {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 20px;
-        font-size: 12px;
-        font-weight: 600;
-        margin: 4px 3px;
-    }
-    .badge-blue  { background:#1e3a5f; color:#90cdf4; }
-    .badge-green { background:#1a3a2a; color:#68d391; }
-    .badge-purple{ background:#2d1b69; color:#b794f4; }
+[data-testid="stSidebar"] {
+    background: #0c1220;
+    border-right: 1px solid #1a2540;
+}
 
-    /* Stat box */
-    .stat-box {
-        background: #1e2130;
-        border: 1px solid #2d3148;
-        border-radius: 10px;
-        padding: 14px;
-        text-align: center;
-    }
-    .stat-val { font-size: 22px; font-weight: 700; color: #e2e8f0; }
-    .stat-lbl { font-size: 11px; color: #718096; text-transform: uppercase; letter-spacing: 0.8px; }
+/* ── version selector cards ── */
+.ver-card {
+    background: #0f1929;
+    border: 1px solid #1e3050;
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: border-color .2s;
+}
+.ver-card:hover   { border-color: #3b6fd4; }
+.ver-card.selected{ border-color: #4f8ef7; background: #102040; }
+.ver-tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    font-family: 'DM Mono', monospace;
+}
+.ver-name {
+    font-size: 13px;
+    font-weight: 700;
+    color: #c8d8f0;
+    margin-bottom: 4px;
+}
+.ver-desc { font-size: 11px; color: #4a6080; line-height: 1.5; }
 
-    /* Upload area */
-    [data-testid="stFileUploader"] {
-        border: 2px dashed #3d4263 !important;
-        border-radius: 12px !important;
-        background: #1a1d27 !important;
-    }
+/* ── stat boxes ── */
+.stat-box {
+    background: #0f1929;
+    border: 1px solid #1e3050;
+    border-radius: 10px;
+    min-height: 88px;
+    padding: 14px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+.stat-val { font-size: 20px; font-weight: 700; color: #c8d8f0;
+            font-family: 'DM Mono', monospace; line-height: 1.1; white-space: nowrap; }
+.stat-lbl { font-size: 10px; color: #3a5070; text-transform: uppercase;
+            letter-spacing: 1px; margin-top: 3px; }
 
-    /* Buttons */
-    .stButton > button {
-        background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-        color: white;
-        border: none;
-        border-radius: 8px;
-        padding: 10px 28px;
-        font-weight: 600;
-        width: 100%;
-    }
-    .stButton > button:hover {
-        background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%);
-    }
+/* ── img card labels ── */
+.img-label {
+    font-size: 11px;
+    font-weight: 700;
+    color: #3a6090;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 8px;
+    font-family: 'DM Mono', monospace;
+}
 
-    /* Slider */
-    .stSlider [data-baseweb="slider"] { padding-top: 4px; }
+/* ── enhance button ── */
+.stButton > button {
+    background: linear-gradient(135deg, #1a4fd6 0%, #2563eb 50%, #1d4ed8 100%);
+    color: #e8f0ff;
+    border: 1px solid #3b6fd4;
+    border-radius: 8px;
+    padding: 10px 28px;
+    font-weight: 700;
+    font-family: 'Syne', sans-serif;
+    letter-spacing: 0.5px;
+    width: 100%;
+    transition: all .2s;
+}
+.stButton > button:hover {
+    background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
+    border-color: #60a5fa;
+}
 
-    /* Hide Streamlit branding */
-    #MainMenu, footer { visibility: hidden; }
-    header { visibility: hidden; }
+/* ── download button ── */
+.stDownloadButton > button {
+    background: #0f1929 !important;
+    color: #60a5fa !important;
+    border: 1px solid #1e3a5f !important;
+    border-radius: 8px !important;
+    font-family: 'DM Mono', monospace !important;
+    font-size: 13px !important;
+    width: 100% !important;
+    margin-top: 8px;
+}
+.stDownloadButton > button:hover {
+    border-color: #3b82f6 !important;
+    background: #102040 !important;
+}
+
+/* ── divider ── */
+hr { border-color: #1a2540 !important; }
+
+/* ── section header ── */
+.section-hdr {
+    font-size: 11px;
+    font-weight: 700;
+    color: #2a4060;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin: 18px 0 10px;
+    font-family: 'DM Mono', monospace;
+}
+
+/* ── denoise badge ── */
+.dnoise-on  { color: #68d391; font-size: 12px; font-family:'DM Mono',monospace; }
+.dnoise-off { color: #4a6080; font-size: 12px; font-family:'DM Mono',monospace; }
+
+/* hide streamlit chrome */
+#MainMenu, footer, header { visibility: hidden; }
+
+/* sliders */
+[data-testid="stSlider"] label { color: #4a7090; font-size: 12px; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 🌙 Zero-DCE++ SE-Block")
+    st.markdown("## 🌙 Zero-DCE++")
+    st.markdown('<div style="color:#2a4060;font-size:12px;font-family:\'DM Mono\',monospace;">SE-BLOCK · CHANNEL ATTENTION</div>', unsafe_allow_html=True)
+    st.markdown("---")
+
+    # ── Model Version Selector ──────────────────────
+    st.markdown('<div class="section-hdr">Model Version</div>', unsafe_allow_html=True)
+
+    version_names = list(MODEL_REGISTRY.keys())
+    selected_version = st.radio(
+        label="Select version",
+        options=version_names,
+        index=0,
+        label_visibility="collapsed",
+    )
+
+    # Show card for selected version
+    ver = MODEL_REGISTRY[selected_version]
     st.markdown(
-        '<span class="badge badge-blue">Zero-DCE++</span>'
-        '<span class="badge badge-purple">SE-Block</span>'
-        '<span class="badge badge-green">Channel Attention</span>',
-        unsafe_allow_html=True
-    )
-    st.markdown("---")
-
-    st.markdown("### ⚙️ Model Weights")
-    weights_file = st.file_uploader(
-        "Upload `.pth` file",
-        type=["pth"],
-        help="Upload best_zerodce_seblock_v2.pth (or any compatible checkpoint)",
+        f'<div class="ver-card selected">'
+        f'<div class="ver-tag" style="background:{ver["tag_color"]};color:{ver["tag_text"]}">{ver["tag"]}</div>'
+        f'<div class="ver-name">{ver["file"]}</div>'
+        f'<div class="ver-desc">{ver["desc"]}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
 
+    # Check if .pth exists
+    pth_path = ver["file"]
+    model_ready = os.path.exists(pth_path)
+    if not model_ready:
+        st.warning(f"⚠️ `{pth_path}` not found.\nPlace the `.pth` file in the same folder as `app.py`.")
+    else:
+        st.success(f"✅ Checkpoint found")
+
     st.markdown("---")
-    st.markdown("### 🎛️ Enhancement Settings")
+
+    # ── Enhancement Settings ────────────────────────
+    st.markdown('<div class="section-hdr">Enhancement Settings</div>', unsafe_allow_html=True)
 
     iterations = st.slider(
         "Curve Iterations",
         min_value=1, max_value=16, value=8,
-        help="Number of times the LE(x;α) curve is applied. More = brighter."
+        help="How many times LE(x;α)=x+α·x·(1−x) is applied. More = brighter output.",
     )
 
     max_size = st.select_slider(
         "Max Image Size (px)",
         options=[256, 512, 768, 1024, 1280, 1600, 2048],
         value=1024,
-        help="Images larger than this will be resized before inference."
+        help="Images larger than this are downscaled before inference.",
     )
 
     st.markdown("---")
-    st.markdown("### ℹ️ Architecture")
-    st.markdown("""
-- **Backbone**: Zero-DCE++ (7 conv layers)  
-- **Novelty**: SE-Block after Conv3  
-- **Output**: 24 α maps → 8 × RGB curves  
-- **Loss**: L_spa + 10·L_exp + 5·L_col + 1600·L_tv  
-    """)
 
-    device_name = "CUDA (GPU)" if torch.cuda.is_available() else "CPU"
-    st.markdown(f"**Device:** `{device_name}`")
+    # ── Denoising Settings ──────────────────────────
+    st.markdown('<div class="section-hdr">Denoising (Bilateral Filter)</div>', unsafe_allow_html=True)
 
+    denoise_on = st.toggle(
+        "Apply bilateral denoising",
+        value=True,
+        help="Edge-preserving noise reduction applied AFTER enhancement. "
+             "Recommended for real-world photos. Turn off for LOL-v2 metric evaluation.",
+    )
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
-
-st.markdown("# 🌙 Low-Light Image Enhancer")
-st.markdown("Upload a model checkpoint, then enhance your dark images using **Zero-DCE++ with SE-Block channel attention**.")
-st.markdown("---")
-
-# ── Model loading state ──────────────────────
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = None
-
-if weights_file is not None:
-    # Save uploaded weights to a temp file
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pth") as tmp:
-        tmp.write(weights_file.read())
-        tmp_path = tmp.name
-    try:
-        model = load_model(tmp_path, device)
-        st.success(f"✅ Model loaded — {sum(p.numel() for p in model.parameters()):,} parameters")
-    except Exception as e:
-        st.error(f"❌ Failed to load model: {e}")
-    finally:
-        os.unlink(tmp_path)
-else:
-    st.info("👈 Upload your `.pth` weights file in the sidebar to get started.")
-
-st.markdown("---")
-
-# ── Image upload ─────────────────────────────
-st.markdown("### 📁 Upload Images")
-uploaded_images = st.file_uploader(
-    "Drop low-light images here (JPG / PNG / WEBP)",
-    type=["jpg", "jpeg", "png", "webp"],
-    accept_multiple_files=True,
-)
-
-if uploaded_images:
-    # ── Enhance button ───────────────────────
-    col_btn, _ = st.columns([1, 3])
-    with col_btn:
-        run = st.button("✨ Enhance All", disabled=(model is None))
+    if denoise_on:
+        st.markdown(
+            '<span class="dnoise-on">● Denoising ON</span> — '
+            '<span style="color:#2a4060;font-size:11px;">bilateral filter active</span>',
+            unsafe_allow_html=True,
+        )
+        with st.expander("Filter parameters", expanded=False):
+            d_val     = st.slider("Diameter (d)",         5, 15,  9, 2,
+                                  help="Filter neighbourhood size. Larger = smoother but slower.")
+            sig_color = st.slider("Sigma Color",          25, 150, 75, 5,
+                                  help="How similar colours must be to be blended. Higher = more smoothing.")
+            sig_space = st.slider("Sigma Space",          25, 150, 75, 5,
+                                  help="Spatial influence radius. Higher = wider smooth area.")
+    else:
+        st.markdown(
+            '<span class="dnoise-off">○ Denoising OFF</span> — '
+            '<span style="color:#2a4060;font-size:11px;">raw curve output</span>',
+            unsafe_allow_html=True,
+        )
+        d_val = sig_color = sig_space = None
 
     st.markdown("---")
 
-    for idx, uploaded in enumerate(uploaded_images):
-        img_orig = Image.open(uploaded).convert("RGB")
-        W, H = img_orig.size
+    # ── Architecture Info ───────────────────────────
+    st.markdown('<div class="section-hdr">Architecture</div>', unsafe_allow_html=True)
+    st.markdown("""
+<div style="color:#2a4060;font-size:12px;line-height:2;font-family:'DM Mono',monospace;">
+backbone &nbsp;→ Zero-DCE++ (7 conv)<br>
+novelty &nbsp;&nbsp;→ SE-Block after Conv3<br>
+output &nbsp;&nbsp;&nbsp;→ 24 α maps (8×RGB)<br>
+loss &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ spa + exp + col + tv<br>
+denoise &nbsp;&nbsp;→ bilateral (inference)
+</div>
+""", unsafe_allow_html=True)
 
-        # Resize if needed
-        if max(W, H) > max_size:
-            scale = max_size / max(W, H)
-            img_input = img_orig.resize((int(W * scale), int(H * scale)), Image.LANCZOS)
-        else:
-            img_input = img_orig
+    device_str = "CUDA (GPU)" if torch.cuda.is_available() else "CPU"
+    st.markdown(f'<div style="color:#2a4060;font-size:11px;margin-top:12px;font-family:\'DM Mono\',monospace;">device → {device_str}</div>', unsafe_allow_html=True)
 
-        st.markdown(f"#### 🖼️ {uploaded.name}")
 
-        # Stats row
-        s1, s2, s3, s4 = st.columns(4)
-        with s1:
-            st.markdown(f'<div class="stat-box"><div class="stat-val">{W}×{H}</div><div class="stat-lbl">Original Size</div></div>', unsafe_allow_html=True)
-        with s2:
-            st.markdown(f'<div class="stat-box"><div class="stat-val">{img_input.size[0]}×{img_input.size[1]}</div><div class="stat-lbl">Inference Size</div></div>', unsafe_allow_html=True)
-        with s3:
-            avg_brightness = int(np.array(img_input).mean())
-            st.markdown(f'<div class="stat-box"><div class="stat-val">{avg_brightness}</div><div class="stat-lbl">Avg Brightness</div></div>', unsafe_allow_html=True)
-        with s4:
-            st.markdown(f'<div class="stat-box"><div class="stat-val">{iterations}</div><div class="stat-lbl">Curve Iters</div></div>', unsafe_allow_html=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Load model
+# ─────────────────────────────────────────────────────────────────────────────
 
-        st.markdown("")
+model, device = None, torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        col_orig, col_enh = st.columns(2)
+if model_ready:
+    try:
+        model, device = load_model(pth_path)
+    except Exception as e:
+        st.error(f"❌ Failed to load `{pth_path}`: {e}")
+        model = None
 
-        with col_orig:
-            st.markdown('<div class="img-card"><h4>📷 Original (Low-Light)</h4></div>', unsafe_allow_html=True)
-            st.image(img_input, use_container_width=True)
 
-        with col_enh:
-            st.markdown('<div class="img-card"><h4>✨ Enhanced</h4></div>', unsafe_allow_html=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
-            if model is not None and (run or f"enhanced_{idx}" in st.session_state):
-                if run or f"enhanced_{idx}" not in st.session_state:
-                    with st.spinner("Enhancing..."):
-                        t0 = time.time()
-                        enhanced_img = enhance(model, img_input, device, iterations=iterations)
-                        elapsed = time.time() - t0
-                    st.session_state[f"enhanced_{idx}"] = enhanced_img
-                    st.session_state[f"elapsed_{idx}"] = elapsed
+# Title
+st.markdown("""
+<div style="margin-bottom:8px;">
+  <span style="font-size:32px;font-weight:800;color:#c8d8f0;letter-spacing:-0.5px;">
+    Low-Light Image Enhancer
+  </span>
+  <span style="font-size:14px;color:#2a4060;margin-left:12px;font-family:'DM Mono',monospace;">
+    Zero-DCE++ · SE-Block
+  </span>
+</div>
+<div style="color:#2a4060;font-size:13px;margin-bottom:20px;">
+  Select a model version in the sidebar, upload your dark images, and enhance.
+</div>
+""", unsafe_allow_html=True)
 
-                enhanced_img = st.session_state[f"enhanced_{idx}"]
-                st.image(enhanced_img, use_container_width=True)
+# Status bar
+col_s1, col_s2, col_s3 = st.columns(3)
+with col_s1:
+    model_lbl = selected_version.split("—")[0].strip() if "—" in selected_version else selected_version
+    st.markdown(f'<div class="stat-box"><div class="stat-val">{model_lbl}</div><div class="stat-lbl">Active Model</div></div>', unsafe_allow_html=True)
+with col_s2:
+    status_str = "Ready" if (model is not None) else "Not Loaded"
+    status_col = "#68d391" if model else "#f6ad55"
+    st.markdown(f'<div class="stat-box"><div class="stat-val" style="color:{status_col}">{status_str}</div><div class="stat-lbl">Model Status</div></div>', unsafe_allow_html=True)
+with col_s3:
+    dn_str = f"ON (d={d_val}, σ={sig_color})" if denoise_on else "OFF"
+    st.markdown(f'<div class="stat-box"><div class="stat-val" style="font-size:14px">{dn_str}</div><div class="stat-lbl">Bilateral Denoise</div></div>', unsafe_allow_html=True)
 
-                # Metrics
-                orig_arr = np.array(img_input).astype(float)
-                enh_arr  = np.array(enhanced_img).astype(float)
-                brightness_gain = int(enh_arr.mean() - orig_arr.mean())
-                elapsed = st.session_state.get(f"elapsed_{idx}", 0)
+st.markdown("---")
 
-                m1, m2, m3 = st.columns(3)
-                with m1:
-                    st.metric("Brightness Gain", f"+{brightness_gain}", delta=f"+{brightness_gain}")
-                with m2:
-                    st.metric("Inference Time", f"{elapsed:.2f}s")
-                with m3:
-                    avg_enh = int(enh_arr.mean())
-                    st.metric("Avg Brightness", f"{avg_enh}")
+if not model_ready:
+    st.info(f"👈 Place `{ver['file']}` in the same folder as `app.py`, then refresh.")
+elif model is None:
+    st.error("Model failed to load. Check the error above.")
+else:
+    # ── Image upload ───────────────────────────────────────────────────────
+    st.markdown('<div class="section-hdr">Upload Images</div>', unsafe_allow_html=True)
+    uploaded_images = st.file_uploader(
+        "Drop low-light images here",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+    )
 
-                # Download button
-                dl_bytes = pil_to_bytes(enhanced_img, fmt="PNG")
-                fname = uploaded.name.rsplit(".", 1)[0] + "_enhanced.png"
-                st.download_button(
-                    label="⬇️ Download Enhanced",
-                    data=dl_bytes,
-                    file_name=fname,
-                    mime="image/png",
-                    key=f"dl_{idx}",
-                )
-            else:
-                st.markdown(
-                    '<div style="height:200px;display:flex;align-items:center;'
-                    'justify-content:center;color:#4a5568;font-size:14px;">'
-                    '⬆️ Click "Enhance All" to process</div>',
-                    unsafe_allow_html=True
-                )
+    if uploaded_images:
+        col_btn, _ = st.columns([1, 4])
+        with col_btn:
+            run = st.button("✨  Enhance All")
 
         st.markdown("---")
 
-elif model is not None:
-    st.markdown(
-        '<div style="text-align:center;padding:60px;color:#4a5568;">'
-        '<div style="font-size:48px">📷</div>'
-        '<div style="font-size:18px;margin-top:12px">Upload some low-light images to enhance</div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
+        for idx, uploaded in enumerate(uploaded_images):
+            img_orig = Image.open(uploaded).convert("RGB")
+            W, H = img_orig.size
+
+            # Downscale if needed
+            if max(W, H) > max_size:
+                scale = max_size / max(W, H)
+                img_input = img_orig.resize(
+                    (int(W * scale), int(H * scale)), Image.LANCZOS)
+            else:
+                img_input = img_orig
+
+            st.markdown(f'<div style="font-size:15px;font-weight:700;color:#c8d8f0;margin-bottom:12px;">📷 {uploaded.name}</div>', unsafe_allow_html=True)
+
+            # Stats row
+            s1, s2, s3, s4, s5 = st.columns(5)
+            orig_bright = avg_brightness(img_input)
+            with s1:
+                st.markdown(f'<div class="stat-box"><div class="stat-val">{W}×{H}</div><div class="stat-lbl">Original</div></div>', unsafe_allow_html=True)
+            with s2:
+                st.markdown(f'<div class="stat-box"><div class="stat-val">{img_input.size[0]}×{img_input.size[1]}</div><div class="stat-lbl">Inference</div></div>', unsafe_allow_html=True)
+            with s3:
+                st.markdown(f'<div class="stat-box"><div class="stat-val">{orig_bright:.0f}</div><div class="stat-lbl">Input Brightness</div></div>', unsafe_allow_html=True)
+            with s4:
+                st.markdown(f'<div class="stat-box"><div class="stat-val">{iterations}</div><div class="stat-lbl">Curve Iters</div></div>', unsafe_allow_html=True)
+            with s5:
+                dn_label = f"d={d_val}" if denoise_on else "Off"
+                st.markdown(f'<div class="stat-box"><div class="stat-val">{dn_label}</div><div class="stat-lbl">Denoise</div></div>', unsafe_allow_html=True)
+
+            st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
+
+            col_orig, col_enh = st.columns(2)
+
+            with col_orig:
+                st.markdown('<div class="img-label">📷 Original (low-light)</div>', unsafe_allow_html=True)
+                st.image(img_input, use_container_width=True)
+
+            with col_enh:
+                enh_label = "✨ Enhanced" + (" + Bilateral Denoise" if denoise_on else "")
+                st.markdown(f'<div class="img-label">{enh_label}</div>', unsafe_allow_html=True)
+
+                cache_key = f"enh_{idx}_{selected_version}_{iterations}_{denoise_on}_{d_val}_{sig_color}_{sig_space}"
+
+                if run or cache_key in st.session_state:
+                    if run or cache_key not in st.session_state:
+                        with st.spinner("Enhancing…"):
+                            t0 = time.time()
+                            result = run_enhance(
+                                model, device, img_input,
+                                iterations=iterations,
+                                denoise=denoise_on,
+                                d=d_val if denoise_on else 9,
+                                sigma_color=sig_color if denoise_on else 75,
+                                sigma_space=sig_space if denoise_on else 75,
+                            )
+                            elapsed = time.time() - t0
+                        st.session_state[cache_key]               = result
+                        st.session_state[cache_key + "_time"]     = elapsed
+
+                    result  = st.session_state[cache_key]
+                    elapsed = st.session_state.get(cache_key + "_time", 0)
+
+                    st.image(result, use_container_width=True)
+
+                    # Metrics
+                    enh_bright = avg_brightness(result)
+                    gain       = enh_bright - orig_bright
+
+                    m1, m2, m3 = st.columns(3)
+                    with m1:
+                        st.metric("Brightness Gain", f"+{gain:.1f}", delta=f"+{gain:.1f}")
+                    with m2:
+                        st.metric("Inference Time", f"{elapsed:.2f}s")
+                    with m3:
+                        st.metric("Output Brightness", f"{enh_bright:.1f}")
+
+                    # Download
+                    fname = uploaded.name.rsplit(".", 1)[0] + "_enhanced.png"
+                    st.download_button(
+                        label="⬇️  Download Enhanced PNG",
+                        data=pil_to_bytes(result),
+                        file_name=fname,
+                        mime="image/png",
+                        key=f"dl_{idx}_{selected_version}",
+                    )
+                else:
+                    st.markdown(
+                        '<div style="height:220px;display:flex;align-items:center;'
+                        'justify-content:center;color:#1e3050;font-size:13px;'
+                        'border:1px dashed #1a2540;border-radius:8px;'
+                        'font-family:\'DM Mono\',monospace;">'
+                        'click Enhance All to process →</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            st.markdown("---")
+
+    else:
+        # Empty state
+        st.markdown("""
+<div style="text-align:center;padding:80px 0;color:#1a2540;">
+  <div style="font-size:52px;margin-bottom:16px;">🌑</div>
+  <div style="font-size:18px;font-weight:700;color:#2a4060;margin-bottom:8px;">
+    No images uploaded yet
+  </div>
+  <div style="font-size:13px;color:#1a2540;font-family:'DM Mono',monospace;">
+    drop your low-light photos above to get started
+  </div>
+</div>
+""", unsafe_allow_html=True)
