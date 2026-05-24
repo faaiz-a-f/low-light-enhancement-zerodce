@@ -310,8 +310,8 @@ The best checkpoint is saved automatically as `best_zerodce_seblock_v4.pth`.
 from google.colab import drive
 drive.mount('/content/drive')
 
-!git clone https://github.com/YOUR_USERNAME/zero-dce-seblock.git
-%cd zero-dce-seblock
+!git clone https://github.com/Faaiz-A-F/low-light-enhancement-zerodce
+%cd low-light-enhancement-zerodce
 !pip install lpips piq -q
 ```
 
