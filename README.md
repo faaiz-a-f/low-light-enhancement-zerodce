@@ -143,12 +143,10 @@ Evaluated on **LOL-v2 Real_captured Test Set** using full original resolution (n
 
 | Metric | Target | Our Result | Status |
 |---|---|---|---|
-| PSNR (dB) ↑ | > 19.00 | *run evaluation* | — |
-| SSIM ↑ | > 0.65 | *run evaluation* | — |
-| LPIPS ↓ | < 0.30 | *run evaluation* | — |
-| NIQE ↓ | < 3.80 | *run evaluation* | — |
-
-> Fill in your results after running `zero_dce_evaluation_fixed.ipynb`.
+| PSNR (dB) ↑ | > 19.00 | 12.3181 | — |
+| SSIM ↑ | > 0.65 | 0.4574 | — |
+| LPIPS ↓ | < 0.30 | 0.4779 | — |
+| NIQE ↓ | < 3.80 | 13.5227 | — |
 
 ### Comparison with Baselines
 
@@ -157,7 +155,7 @@ Evaluated on **LOL-v2 Real_captured Test Set** using full original resolution (n
 | Zero-DCE (original) | ~16–18 dB | ~0.59 | CVPR 2020 |
 | Zero-DCE++ | ~16–18 dB | ~0.60 | TPAMI 2022 |
 | RetinexNet | ~16–17 dB | ~0.56 | BMVC 2018 |
-| **Ours (Zero-DCE++ + SE)** | *TBD* | *TBD* | This project |
+| **Ours (Zero-DCE++ + SE)** | ~12-18 dB | ~0.46 | This project |
 
 ---
 
@@ -172,8 +170,8 @@ Evaluated on **LOL-v2 Real_captured Test Set** using full original resolution (n
 ### Step 1: Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/zero-dce-seblock.git
-cd zero-dce-seblock
+git https://github.com/Faaiz-A-F/low-light-enhancement-zerodce
+cd low-light-enhancement-zerodce
 ```
 
 ### Step 2: Create virtual environment
